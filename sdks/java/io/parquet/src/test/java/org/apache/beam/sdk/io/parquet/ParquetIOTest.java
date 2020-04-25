@@ -69,23 +69,56 @@ public class ParquetIOTest implements Serializable {
         "Faraday", "Newton", "Bohr", "Galilei", "Maxwell"
       };
 
+  private String writeRecords(List<GenericRecord> records) {
+    String tempPath = temporaryFolder.getRoot().getAbsolutePath();
+
+    mainPipeline
+        .apply(Create.of(records).withCoder(AvroCoder.of(SCHEMA)))
+        .apply(FileIO.<GenericRecord>write().via(ParquetIO.sink(SCHEMA)).to(tempPath));
+    mainPipeline.run().waitUntilFinish();
+
+    return tempPath;
+  }
+
   @Test
   public void testWriteAndRead() {
     List<GenericRecord> records = generateGenericRecords(1000);
 
-    mainPipeline
-        .apply(Create.of(records).withCoder(AvroCoder.of(SCHEMA)))
-        .apply(
-            FileIO.<GenericRecord>write()
-                .via(ParquetIO.sink(SCHEMA))
-                .to(temporaryFolder.getRoot().getAbsolutePath()));
-    mainPipeline.run().waitUntilFinish();
+    String tempPath = writeRecords(records);
 
     PCollection<GenericRecord> readBack =
-        readPipeline.apply(
-            ParquetIO.read(SCHEMA).from(temporaryFolder.getRoot().getAbsolutePath() + "/*"));
+        readPipeline.apply(ParquetIO.read(SCHEMA).from(tempPath + "/*"));
 
     PAssert.that(readBack).containsInAnyOrder(records);
+    Assert.assertEquals(1000, records.size());
+    readPipeline.run().waitUntilFinish();
+  }
+
+  @Test
+  public void testWriteAndReadWithSmallFiles() {
+    List<GenericRecord> records = generateGenericRecords(1000);
+
+    String tempPath = writeRecords(records);
+
+    PCollection<GenericRecord> readBack =
+        readPipeline.apply(ParquetIO.read(SCHEMA).from(tempPath + "/*").withSmallFiles(true));
+
+    PAssert.that(readBack).containsInAnyOrder(records);
+    Assert.assertEquals(1000, records.size());
+    readPipeline.run().waitUntilFinish();
+  }
+
+  @Test
+  public void testWriteAndReadWithNoSmallFiles() {
+    List<GenericRecord> records = generateGenericRecords(1000);
+
+    String tempPath = writeRecords(records);
+
+    PCollection<GenericRecord> readBack =
+        readPipeline.apply(ParquetIO.read(SCHEMA).from(tempPath + "/*").withSmallFiles(false));
+
+    PAssert.that(readBack).containsInAnyOrder(records);
+    Assert.assertEquals(1000, records.size());
     readPipeline.run().waitUntilFinish();
   }
 
