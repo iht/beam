@@ -44,6 +44,7 @@ import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.commons.compress.utils.SeekableInMemoryByteChannel;
 import org.apache.parquet.avro.AvroParquetReader;
 import org.apache.parquet.avro.AvroParquetWriter;
 import org.apache.parquet.hadoop.ParquetReader;
@@ -144,6 +145,8 @@ public class ParquetIO {
   /** Implementation of {@link #read(Schema)}. */
   @AutoValue
   public abstract static class Read extends PTransform<PBegin, PCollection<GenericRecord>> {
+    @Nullable
+    abstract Boolean getWithSmallFiles();
 
     @Nullable
     abstract ValueProvider<String> getFilepattern();
@@ -158,6 +161,8 @@ public class ParquetIO {
 
     @AutoValue.Builder
     abstract static class Builder {
+      abstract Builder setWithSmallFiles(Boolean withSmallFiles);
+
       abstract Builder setFilepattern(ValueProvider<String> filepattern);
 
       abstract Builder setSchema(Schema schema);
@@ -184,6 +189,22 @@ public class ParquetIO {
       return toBuilder().setAvroDataModel(model).build();
     }
 
+    /**
+     * Reads all files entirely in memory, for better performance.
+     *
+     * <p>If not used, some small files (<64 MB) will be read in memory. The rest of files will be
+     * accessed online.
+     *
+     * <p>If set to true, all files are cached in memory, for better performance. If a file is very
+     * large, this can cause Out of Memory errors. Use only when you are sure your files are small.
+     *
+     * <p>If set to false, no file is cached in memory and all files are accessed online. Use only
+     * when you want to save memory sacrificing performance.
+     */
+    public Read withSmallFiles(Boolean smallFiles) {
+      return toBuilder().setWithSmallFiles(smallFiles).build();
+    }
+
     @Override
     public PCollection<GenericRecord> expand(PBegin input) {
       checkNotNull(getFilepattern(), "Filepattern cannot be null.");
@@ -192,7 +213,10 @@ public class ParquetIO {
           .apply("Create filepattern", Create.ofProvider(getFilepattern(), StringUtf8Coder.of()))
           .apply(FileIO.matchAll())
           .apply(FileIO.readMatches())
-          .apply(readFiles(getSchema()).withAvroDataModel(getAvroDataModel()));
+          .apply(
+              readFiles(getSchema())
+                  .withAvroDataModel(getAvroDataModel())
+                  .withSmallFiles(getWithSmallFiles()));
     }
 
     @Override
@@ -207,6 +231,8 @@ public class ParquetIO {
   @AutoValue
   public abstract static class ReadFiles
       extends PTransform<PCollection<FileIO.ReadableFile>, PCollection<GenericRecord>> {
+    @Nullable
+    abstract Boolean getWithSmallFiles();
 
     @Nullable
     abstract Schema getSchema();
@@ -218,6 +244,8 @@ public class ParquetIO {
 
     @AutoValue.Builder
     abstract static class Builder {
+      abstract Builder setWithSmallFiles(Boolean withSmallFiles);
+
       abstract Builder setSchema(Schema schema);
 
       abstract Builder setAvroDataModel(GenericData model);
@@ -232,20 +260,27 @@ public class ParquetIO {
       return toBuilder().setAvroDataModel(model).build();
     }
 
+    /** See {@link Read#withSmallFiles(Boolean)}. */
+    public ReadFiles withSmallFiles(Boolean smallFiles) {
+      return toBuilder().setWithSmallFiles(smallFiles).build();
+    }
+
     @Override
     public PCollection<GenericRecord> expand(PCollection<FileIO.ReadableFile> input) {
       checkNotNull(getSchema(), "Schema can not be null");
       return input
-          .apply(ParDo.of(new ReadFn(getAvroDataModel())))
+          .apply(ParDo.of(new ReadFn(getAvroDataModel(), getWithSmallFiles())))
           .setCoder(AvroCoder.of(getSchema()));
     }
 
     static class ReadFn extends DoFn<FileIO.ReadableFile, GenericRecord> {
 
       private Class<? extends GenericData> modelClass;
+      private final Boolean withSmallFiles;
 
-      ReadFn(GenericData model) {
+      ReadFn(GenericData model, Boolean withSmallFiles) {
         this.modelClass = model != null ? model.getClass() : null;
+        this.withSmallFiles = withSmallFiles;
       }
 
       @ProcessElement
@@ -257,10 +292,21 @@ public class ParquetIO {
           throw new RuntimeException(String.format("File has to be seekable: %s", filename));
         }
 
-        SeekableByteChannel seekableByteChannel = file.openSeekable();
+        /** Read mode for ParquetIO files */
+        BeamParquetInputFile.ReadMode readMode;
+        if (this.withSmallFiles == null) {
+          // If not set, read small files in memory
+          readMode = BeamParquetInputFile.ReadMode.SOME_FILES_IN_MEMORY;
+        } else if (this.withSmallFiles) {
+          // Read all files in memory, because they are small
+          readMode = BeamParquetInputFile.ReadMode.ALL_FILES_IN_MEMORY;
+        } else {
+          // If small files is set to false, read all files online, with no memory caching
+          readMode = BeamParquetInputFile.ReadMode.NO_CACHING_IN_MEMORY;
+        }
 
         AvroParquetReader.Builder builder =
-            AvroParquetReader.<GenericRecord>builder(new BeamParquetInputFile(seekableByteChannel));
+            AvroParquetReader.<GenericRecord>builder(new BeamParquetInputFile(file, readMode));
         if (modelClass != null) {
           // all GenericData implementations have a static get method
           builder = builder.withDataModel((GenericData) modelClass.getMethod("get").invoke(null));
@@ -277,15 +323,40 @@ public class ParquetIO {
 
     private static class BeamParquetInputFile implements InputFile {
 
+      private static final long MAX_SIZE_READ_MEMORY = 64 * 1024 * 1024L;
       private SeekableByteChannel seekableByteChannel;
+      private FileIO.ReadableFile file;
 
-      BeamParquetInputFile(SeekableByteChannel seekableByteChannel) {
-        this.seekableByteChannel = seekableByteChannel;
+      private enum ReadMode {
+        SOME_FILES_IN_MEMORY,
+        ALL_FILES_IN_MEMORY,
+        NO_CACHING_IN_MEMORY
+      }
+
+      BeamParquetInputFile(FileIO.ReadableFile file, ReadMode readMode) throws IOException {
+        this.file = file;
+        Boolean isFileSmall = getLength() < MAX_SIZE_READ_MEMORY;
+
+        switch (readMode) {
+          case ALL_FILES_IN_MEMORY:
+            this.seekableByteChannel = new SeekableInMemoryByteChannel(file.readFullyAsBytes());
+            break;
+          case SOME_FILES_IN_MEMORY:
+            if (isFileSmall) {
+              this.seekableByteChannel = new SeekableInMemoryByteChannel(file.readFullyAsBytes());
+            } else {
+              this.seekableByteChannel = file.openSeekable();
+            }
+
+            break;
+          default:
+            this.seekableByteChannel = file.openSeekable();
+        }
       }
 
       @Override
       public long getLength() throws IOException {
-        return seekableByteChannel.size();
+        return file.getMetadata().sizeBytes();
       }
 
       @Override
