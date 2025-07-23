@@ -1049,8 +1049,22 @@ public class StorageApiWriteUnshardedRecords<DestinationT, ElementT>
         // await is called, so
         // this approach means that if one call fais, it has to wait for all prior calls to complete
         // before a retry happens.
-        for (RetryManager<AppendRowsResponse, AppendRowsContext> retryManager : retryManagers) {
-          retryManager.await();
+        try {
+          retryManagers
+              .parallelStream()
+              .forEach(
+                  retryManager -> {
+                    try {
+                      retryManager.await();
+                    } catch (Exception e) {
+                      throw new RuntimeException(e);
+                    }
+                  });
+        } catch (RuntimeException e) {
+          if (e.getCause() instanceof Exception) {
+            throw (Exception) e.getCause();
+          }
+          throw e;
         }
       }
       for (DestinationState destinationState :
