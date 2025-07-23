@@ -25,6 +25,7 @@ import javax.annotation.Nullable;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.Redistribute;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionTuple;
@@ -99,31 +100,33 @@ public class StorageApiWriteRecordsInconsistent<DestinationT, ElementT>
       tupleTagList = tupleTagList.and(successfulRowsTag);
     }
     PCollectionTuple result =
-        input.apply(
-            "Write Records",
-            ParDo.of(
-                    new StorageApiWriteUnshardedRecords.WriteRecordsDoFn<>(
-                        operationName,
-                        dynamicDestinations,
-                        bqServices,
-                        true,
-                        bigQueryOptions.getStorageApiAppendThresholdBytes(),
-                        bigQueryOptions.getStorageApiAppendThresholdRecordCount(),
-                        bigQueryOptions.getNumStorageWriteApiStreamAppendClients(),
-                        finalizeTag,
-                        failedRowsTag,
-                        successfulRowsTag,
-                        successfulRowsPredicate,
-                        autoUpdateSchema,
-                        ignoreUnknownValues,
-                        createDisposition,
-                        kmsKey,
-                        usesCdc,
-                        defaultMissingValueInterpretation,
-                        bigQueryOptions.getStorageWriteApiMaxRetries(),
-                        bigLakeConfiguration))
-                .withOutputTags(finalizeTag, tupleTagList)
-                .withSideInputs(dynamicDestinations.getSideInputs()));
+        input
+            .apply("RedistributeByDestination", Redistribute.byKey())
+            .apply(
+                "Write Records",
+                ParDo.of(
+                        new StorageApiWriteUnshardedRecords.WriteRecordsDoFn<>(
+                            operationName,
+                            dynamicDestinations,
+                            bqServices,
+                            true,
+                            bigQueryOptions.getStorageApiAppendThresholdBytes(),
+                            bigQueryOptions.getStorageApiAppendThresholdRecordCount(),
+                            bigQueryOptions.getNumStorageWriteApiStreamAppendClients(),
+                            finalizeTag,
+                            failedRowsTag,
+                            successfulRowsTag,
+                            successfulRowsPredicate,
+                            autoUpdateSchema,
+                            ignoreUnknownValues,
+                            createDisposition,
+                            kmsKey,
+                            usesCdc,
+                            defaultMissingValueInterpretation,
+                            bigQueryOptions.getStorageWriteApiMaxRetries(),
+                            bigLakeConfiguration))
+                    .withOutputTags(finalizeTag, tupleTagList)
+                    .withSideInputs(dynamicDestinations.getSideInputs()));
     result.get(failedRowsTag).setCoder(failedRowsCoder);
     if (successfulRowsTag != null) {
       result.get(successfulRowsTag).setCoder(successfulRowsCoder);
